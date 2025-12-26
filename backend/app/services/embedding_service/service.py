@@ -148,6 +148,11 @@ class EmbeddingService:
         texts: List[str],
         max_concurrent_tasks: Optional[int],
     ) -> torch.Tensor:
+        # Handle empty input early to avoid torch.cat([]) errors
+        if not texts:
+            embedding_dim = self.model.get_sentence_embedding_dimension()
+            return torch.empty((0, embedding_dim))
+
         semaphore = self._get_gpu_semaphore(max_concurrent_tasks)
 
         async with semaphore:
