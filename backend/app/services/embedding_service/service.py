@@ -30,8 +30,12 @@ MODEL_NAME = config.MODEL_NAME
 EMBEDDING_DEVICE = config.EMBEDDING_DEVICE
 MAX_BATCH_SIZE = config.MAX_BATCH_SIZE
 SAFE_BATCH_SIZE = getattr(config, "SAFE_BATCH_SIZE", 32)
-EXECUTOR_MAX_WORKERS = getattr(config, "EXECUTOR_MAX_WORKERS", min(2, os.cpu_count() or 1))
-DEFAULT_MAX_CONCURRENT_GPU_TASKS = getattr(config, "MAX_CONCURRENT_GPU_TASKS", 2)
+EXECUTOR_MAX_WORKERS = getattr(
+    config, "EXECUTOR_MAX_WORKERS", min(2, os.cpu_count() or 1)
+)
+DEFAULT_MAX_CONCURRENT_GPU_TASKS = getattr(
+    config, "MAX_CONCURRENT_GPU_TASKS", 2
+)
 
 
 class ProfileSummaryResult(BaseModel):
@@ -41,8 +45,10 @@ class ProfileSummaryResult(BaseModel):
 
 
 class EmbeddingService:
+    # Class-level resources shared across all instances
     _global_model: Optional[SentenceTransformer] = None
     _global_model_lock = threading.Lock()
+    _shutting_down_global = False  # Global shutdown flag for shared model
 
     def __init__(self) -> None:
         self._llm: Optional[ChatGoogleGenerativeAI] = None
@@ -99,11 +105,17 @@ class EmbeddingService:
 
     @property
     def model(self) -> SentenceTransformer:
+        # First check instance shutdown flag
         if self._shutting_down:
-            raise RuntimeError("EmbeddingService is shutting down")
+            raise RuntimeError("This EmbeddingService instance is shutting down")
 
+        # Then check and load model with proper locking
         if EmbeddingService._global_model is None:
             with EmbeddingService._global_model_lock:
+                # Check global shutdown flag inside the lock
+                if EmbeddingService._shutting_down_global:
+                    raise RuntimeError("EmbeddingService globally is shutting down")
+                
                 if EmbeddingService._global_model is None:
                     logger.info("Loading embedding model: %s", MODEL_NAME)
                     EmbeddingService._global_model = SentenceTransformer(
@@ -139,8 +151,9 @@ class EmbeddingService:
         if self.tokenizer:
             try:
                 return len(self.tokenizer.encode(text))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Tokenizer failed: {e}, falling back to heuristic")
+        # Fallback estimation based on words
         return max(1, int(len(text.split()) * 1.3))
 
     async def _encode(
@@ -148,7 +161,6 @@ class EmbeddingService:
         texts: List[str],
         max_concurrent_tasks: Optional[int],
     ) -> torch.Tensor:
-        # Handle empty input early to avoid torch.cat([]) errors
         if not texts:
             embedding_dim = self.model.get_sentence_embedding_dimension()
             return torch.empty((0, embedding_dim))
@@ -197,8 +209,11 @@ class EmbeddingService:
         try:
             response = await self.llm.ainvoke(messages)
             return response.content.strip()
-        except Exception:
-            logger.exception("LLM async invocation failed, falling back to sync")
+        except Exception as e:
+            logger.exception(
+                "LLM invocation failed for profile=%s",
+                getattr(messages[0], "content", "")[:50],
+            )
 
             loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
@@ -250,6 +265,7 @@ class EmbeddingService:
     ) -> List[Dict[str, Any]]:
         query_embedding = await self.get_embedding(query_text, max_concurrent_tasks)
         from app.database.weaviate.operations import search_similar_contributors
+
         return await search_similar_contributors(
             query_embedding=query_embedding,
             limit=limit,
@@ -267,11 +283,14 @@ class EmbeddingService:
             "default_max_concurrent_gpu_tasks": DEFAULT_MAX_CONCURRENT_GPU_TASKS,
             "executor_workers": EXECUTOR_MAX_WORKERS,
             "model_loaded": EmbeddingService._global_model is not None,
+            "global_shutdown": EmbeddingService._shutting_down_global,
+            "instance_shutdown": self._shutting_down,
         }
 
     def shutdown(self) -> None:
+        """Shutdown this instance and optionally the global model if no other instances exist."""
         self._shutting_down = True
-        logger.info("Shutting down EmbeddingService")
+        logger.info("Shutting down EmbeddingService instance")
 
         with self._executor_lock:
             if self._embedding_executor:
@@ -281,10 +300,27 @@ class EmbeddingService:
                 self._llm_executor.shutdown(wait=True)
                 self._llm_executor = None
 
+        # Clear instance-specific resources
+        with self._llm_lock:
+            self._llm = None
+        
+        with self._tokenizer_lock:
+            self._tokenizer = None
+
+        logger.info("EmbeddingService instance shutdown complete")
+
+    @classmethod
+    def shutdown_global(cls) -> None:
+        """Shutdown all global resources (model) shared across all instances."""
+        with cls._global_model_lock:
+            cls._shutting_down_global = True
+            cls._global_model = None
+        
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
-        logger.info("EmbeddingService shutdown complete")
+            logger.info("Cleared GPU cache")
+        
+        logger.info("EmbeddingService global shutdown complete")
 
     async def __aenter__(self) -> "EmbeddingService":
         return self
